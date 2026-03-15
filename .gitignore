@@ -1,0 +1,24 @@
+# Build artifacts
+build/
+dist/
+build_env/
+venv/
+*.spec.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Temp files
+_temp_*
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Test output
+test_documents/*.docx
+output_*.docx
+report.json

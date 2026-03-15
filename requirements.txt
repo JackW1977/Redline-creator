@@ -1,0 +1,9 @@
+# Core dependencies
+lxml>=4.9.0
+
+# Windows COM automation (for highest-fidelity tracked changes)
+# Only needed on Windows with Microsoft Word installed
+pywin32>=306; sys_platform == "win32"
+
+# Drag-and-drop support for the GUI (optional but recommended)
+tkinterdnd2>=0.3.0
