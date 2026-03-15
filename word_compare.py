@@ -75,39 +75,35 @@ def compare_with_word_com(
         word.Visible = False
         word.DisplayAlerts = 0  # wdAlertsNone
 
-        logger.info("Opening latest revision in Word...")
-        latest_doc = word.Documents.Open(
-            str(latest_rev_path),
+        # Open the EARLY revision as the "original" base document.
+        # We then compare it against the LATEST revision.
+        # This way Word's comparison engine treats:
+        #   - Early Rev = original document
+        #   - Latest Rev = revised document
+        # Result:
+        #   - Insertions (green/underline) = NEW content added in Latest Rev
+        #   - Deletions (red/strikethrough) = content DELETED from Early Rev
+        #   - Replacements = old text deleted + new text inserted (UPDATED)
+        logger.info("Opening early revision as baseline in Word...")
+        early_doc = word.Documents.Open(
+            str(early_rev_path),
             ReadOnly=True,
             AddToRecentFiles=False,
         )
 
-        logger.info("Running Word comparison engine...")
-        # Document.Compare parameters:
-        # Name, AuthorName, CompareTarget, DetectFormatChanges,
-        # IgnoreAllComparisonWarnings, AddToRecentFiles, RemovePersonalInformation,
-        # RemoveDateAndTime
-        #
-        # CompareTarget: 0=wdCompareTargetSelected, 1=wdCompareTargetCurrent, 2=wdCompareTargetNew
-        # We use wdCompareTargetNew (2) to create a new document
-        compared_doc = latest_doc.Compare(
-            Name=str(early_rev_path),
+        logger.info("Running Word comparison engine (Early → Latest)...")
+        # Document.Compare(Name):
+        #   The document you call Compare on = original
+        #   The Name parameter = revised (the document it is compared against)
+        # CompareTarget=2 → wdCompareTargetNew (output to a new document)
+        early_doc.Compare(
+            Name=str(latest_rev_path),
             AuthorName=author,
             CompareTarget=2,  # wdCompareTargetNew - creates new comparison doc
             DetectFormatChanges=True,
             IgnoreAllComparisonWarnings=True,
             AddToRecentFiles=False,
         )
-
-        # The comparison creates a new document that's now the active doc
-        # It shows Early Rev as the base with changes to reach Latest Rev
-        # We need to reverse this: Latest Rev as base with changes FROM Early Rev
-        #
-        # Word.Compare(A, B) produces: "B was the original, here's what changed to get A"
-        # Since we opened Latest and compared against Early:
-        # Result = "Early was original, changes show how to get to Latest"
-        # This is exactly what we want: Latest Rev as the visual base,
-        # tracked changes showing what changed from Early Rev.
 
         active_doc = word.ActiveDocument
 
@@ -120,7 +116,7 @@ def compare_with_word_com(
 
         # Close documents
         active_doc.Close(SaveChanges=0)
-        latest_doc.Close(SaveChanges=0)
+        early_doc.Close(SaveChanges=0)
 
         logger.info("Word comparison complete.")
         return True, f"Comparison document saved to {output_path}"
@@ -178,20 +174,20 @@ def compare_with_xml(
 ) -> tuple[bool, str]:
     """Pure-Python Open XML comparison fallback.
 
-    This produces lower-fidelity tracked changes by:
-    1. Starting from the Latest Rev as the base document
-    2. Extracting paragraph-level text from both documents
-    3. Using difflib to compute paragraph-level diffs
-    4. Injecting <w:ins> and <w:del> markup into the output XML
+    Produces tracked changes showing:
+      - Insertions  = content ADDED in Latest Rev (not in Early Rev)
+      - Deletions   = content DELETED from Early Rev (not in Latest Rev)
+      - Replacements = old text deleted + new text inserted (UPDATED)
 
     Limitations vs COM:
-    - Only paragraph-level granularity (not word/character level within paragraphs)
+    - Paragraph-level granularity (not word/character level within paragraphs)
     - Cannot detect moves (only shows as delete + insert)
     - Cannot track formatting-only changes
     - May not handle complex table diffs well
     """
     import difflib
     import zipfile
+    from copy import deepcopy
     from datetime import datetime, timezone
 
     from lxml import etree
@@ -202,143 +198,209 @@ def compare_with_xml(
     latest_rev_path = Path(latest_rev_path)
     output_path = Path(output_path)
 
-    # Start with a copy of the latest revision
+    W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+    # Start with a copy of the latest revision (preserves styles/fonts/layout)
     shutil.copy2(latest_rev_path, output_path)
 
-    # Extract text from both
+    # Extract paragraph text from both documents
     early_paras = extract_from_docx(early_rev_path)
     latest_paras = extract_from_docx(latest_rev_path)
 
     early_texts = [p.text for p in early_paras]
     latest_texts = [p.text for p in latest_paras]
 
-    # Compute paragraph-level diff
+    # Compute paragraph-level diff: early (original) → latest (revised)
     sm = difflib.SequenceMatcher(None, early_texts, latest_texts)
     opcodes = sm.get_opcodes()
 
-    # If no changes, just return the copy
     has_changes = any(op != "equal" for op, *_ in opcodes)
     if not has_changes:
         return True, "No differences found between documents."
 
     # Read the latest revision's document.xml
-    W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-
-    import tempfile
-
     with zipfile.ZipFile(output_path, "r") as zf:
         doc_xml = zf.read("word/document.xml")
 
     doc_root = etree.fromstring(doc_xml)
     body = doc_root.find(f"{{{W_NS}}}body")
-
     if body is None:
         return False, "Could not find document body in latest revision."
 
-    # Get all <w:p> elements in document order (excluding those in tables for now)
-    all_paras = list(body.iter(f"{{{W_NS}}}p"))
+    # Get direct <w:p> children of body (skip paragraphs nested in tables etc.)
+    body_paras = [child for child in body if child.tag == f"{{{W_NS}}}p"]
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    change_id = 1000  # Start high to avoid conflicts
+    change_id = 1000  # Start high to avoid conflicts with existing IDs
 
-    # Process opcodes to inject tracked changes
-    # We work backwards through the latest doc to avoid index shifting
-    modifications = []  # (latest_index, operation, early_text)
+    # Also read early doc XML so we can grab original paragraph formatting
+    with zipfile.ZipFile(early_rev_path, "r") as zf:
+        early_doc_xml = zf.read("word/document.xml")
+    early_doc_root = etree.fromstring(early_doc_xml)
+    early_body = early_doc_root.find(f"{{{W_NS}}}body")
+    early_body_paras = [c for c in early_body if c.tag == f"{{{W_NS}}}p"] if early_body is not None else []
 
-    for op, i1, i2, j1, j2 in opcodes:
+    def _next_id():
+        nonlocal change_id
+        cid = change_id
+        change_id += 1
+        return str(cid)
+
+    def _make_ins_para(p_elem):
+        """Wrap all runs in a paragraph with <w:ins> to mark as inserted (ADDED)."""
+        # Collect all non-pPr children (runs, hyperlinks, etc.)
+        children = [c for c in list(p_elem) if c.tag != f"{{{W_NS}}}pPr"]
+        if not children:
+            return
+
+        # Create <w:ins> wrapper
+        ins = etree.Element(f"{{{W_NS}}}ins")
+        ins.set(f"{{{W_NS}}}id", _next_id())
+        ins.set(f"{{{W_NS}}}author", author)
+        ins.set(f"{{{W_NS}}}date", ts)
+
+        # Move each child into the <w:ins> element
+        for child in children:
+            p_elem.remove(child)
+            ins.append(child)
+
+        # Append <w:ins> after pPr (or as first child)
+        ppr = p_elem.find(f"{{{W_NS}}}pPr")
+        if ppr is not None:
+            ppr.addnext(ins)
+        else:
+            p_elem.insert(0, ins)
+
+        # Also mark the paragraph property change (so the paragraph mark itself
+        # is shown as an insertion in Word's revision view)
+        ppr = p_elem.find(f"{{{W_NS}}}pPr")
+        if ppr is None:
+            ppr = etree.SubElement(p_elem, f"{{{W_NS}}}pPr")
+            p_elem.insert(0, ppr)
+        rpr = ppr.find(f"{{{W_NS}}}rPr")
+        if rpr is None:
+            rpr = etree.SubElement(ppr, f"{{{W_NS}}}rPr")
+        rpr_ins = etree.SubElement(rpr, f"{{{W_NS}}}ins")
+        rpr_ins.set(f"{{{W_NS}}}id", _next_id())
+        rpr_ins.set(f"{{{W_NS}}}author", author)
+        rpr_ins.set(f"{{{W_NS}}}date", ts)
+
+    def _make_del_para(text, ref_early_para=None):
+        """Create a new paragraph with <w:del> containing deleted text (DELETED from Early Rev)."""
+        del_para = etree.Element(f"{{{W_NS}}}p")
+
+        # Copy pPr from the original early paragraph if available (preserves style)
+        if ref_early_para is not None:
+            early_ppr = ref_early_para.find(f"{{{W_NS}}}pPr")
+            if early_ppr is not None:
+                del_para.append(deepcopy(early_ppr))
+
+        # Mark paragraph property as deleted
+        ppr = del_para.find(f"{{{W_NS}}}pPr")
+        if ppr is None:
+            ppr = etree.SubElement(del_para, f"{{{W_NS}}}pPr")
+            del_para.insert(0, ppr)
+        rpr = ppr.find(f"{{{W_NS}}}rPr")
+        if rpr is None:
+            rpr = etree.SubElement(ppr, f"{{{W_NS}}}rPr")
+        del_rpr = etree.SubElement(rpr, f"{{{W_NS}}}del")
+        del_rpr.set(f"{{{W_NS}}}id", _next_id())
+        del_rpr.set(f"{{{W_NS}}}author", author)
+        del_rpr.set(f"{{{W_NS}}}date", ts)
+
+        # Add the deleted text inside <w:del> → <w:r> → <w:delText>
+        del_wrapper = etree.SubElement(del_para, f"{{{W_NS}}}del")
+        del_wrapper.set(f"{{{W_NS}}}id", _next_id())
+        del_wrapper.set(f"{{{W_NS}}}author", author)
+        del_wrapper.set(f"{{{W_NS}}}date", ts)
+
+        run = etree.SubElement(del_wrapper, f"{{{W_NS}}}r")
+
+        # Copy run properties from the early paragraph's first run if available
+        if ref_early_para is not None:
+            first_run = ref_early_para.find(f"{{{W_NS}}}r")
+            if first_run is not None:
+                early_rpr = first_run.find(f"{{{W_NS}}}rPr")
+                if early_rpr is not None:
+                    run.append(deepcopy(early_rpr))
+
+        del_text = etree.SubElement(run, f"{{{W_NS}}}delText")
+        del_text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        del_text.text = text
+
+        return del_para
+
+    # Process opcodes in REVERSE order to avoid index shifts when inserting
+    # deleted paragraphs into the body.
+    insert_ops = []  # (position_in_body, element_to_insert_or_mark)
+
+    # Track statistics
+    stats = {"added": 0, "deleted": 0, "updated": 0}
+
+    # We process backwards so inserting elements doesn't shift later indices
+    for op, i1, i2, j1, j2 in reversed(opcodes):
         if op == "equal":
             continue
+
+        if op == "insert":
+            # Paragraphs ADDED in Latest Rev (exist in latest, not in early)
+            # Mark them as insertions in the output
+            for j in range(j1, j2):
+                if j < len(body_paras):
+                    _make_ins_para(body_paras[j])
+                    stats["added"] += 1
+
         elif op == "delete":
-            # Text in early but not in latest -> show as deletion before j1
-            for idx in range(i1, i2):
-                modifications.append(("delete", j1, early_texts[idx]))
-        elif op == "insert":
-            # Text in latest but not in early -> mark as insertion
-            for idx in range(j1, j2):
-                modifications.append(("insert", idx, latest_texts[idx]))
+            # Paragraphs DELETED from Early Rev (exist in early, not in latest)
+            # Insert deleted paragraphs before position j1 in the body
+            # Find the insertion point in the body
+            if j1 < len(body_paras):
+                anchor = body_paras[j1]
+            else:
+                # Append at end (before sectPr if present)
+                sect_pr = body.find(f"{{{W_NS}}}sectPr")
+                anchor = sect_pr  # may be None
+
+            for idx in range(i2 - 1, i1 - 1, -1):
+                early_p = early_body_paras[idx] if idx < len(early_body_paras) else None
+                del_p = _make_del_para(early_texts[idx], ref_early_para=early_p)
+                if anchor is not None:
+                    anchor.addprevious(del_p)
+                else:
+                    body.append(del_p)
+                stats["deleted"] += 1
+
         elif op == "replace":
-            # Changed paragraphs -> deletion of old + insertion of new
-            for idx in range(i1, i2):
-                modifications.append(("delete", j1, early_texts[idx]))
-            for idx in range(j1, j2):
-                modifications.append(("insert", idx, latest_texts[idx]))
+            # Paragraphs UPDATED: old text deleted + new text inserted
+            # 1) Mark latest paragraphs as insertions (new version)
+            for j in range(j1, j2):
+                if j < len(body_paras):
+                    _make_ins_para(body_paras[j])
 
-    # Apply tracked change markup to the document
-    # Mark insertions
-    for mod_type, para_idx, text in modifications:
-        if para_idx >= len(all_paras):
-            continue
+            # 2) Insert early paragraphs as deletions before the first
+            #    inserted paragraph (old version)
+            if j1 < len(body_paras):
+                anchor = body_paras[j1]
+            else:
+                sect_pr = body.find(f"{{{W_NS}}}sectPr")
+                anchor = sect_pr
 
-        target_para = all_paras[para_idx]
+            for idx in range(i2 - 1, i1 - 1, -1):
+                early_p = early_body_paras[idx] if idx < len(early_body_paras) else None
+                del_p = _make_del_para(early_texts[idx], ref_early_para=early_p)
+                if anchor is not None:
+                    anchor.addprevious(del_p)
+                else:
+                    body.append(del_p)
 
-        if mod_type == "insert":
-            # Wrap all runs in this paragraph with <w:ins>
-            runs = list(target_para.iter(f"{{{W_NS}}}r"))
-            if runs:
-                ins_elem = etree.SubElement(target_para, f"{{{W_NS}}}ins")
-                ins_elem.set(f"{{{W_NS}}}id", str(change_id))
-                ins_elem.set(f"{{{W_NS}}}author", author)
-                ins_elem.set(f"{{{W_NS}}}date", ts)
-                change_id += 1
-
-                # Move runs into the ins element
-                for run in runs:
-                    # We need to be careful: just add the ins wrapper attribute
-                    # For simplicity in the XML fallback, we'll use a simpler approach
-                    pass
-
-            # Simplified approach: add rPr with ins marker
-            # This is a limitation of the pure-XML approach
-            ppr = target_para.find(f"{{{W_NS}}}pPr")
-            if ppr is None:
-                ppr = etree.SubElement(target_para, f"{{{W_NS}}}pPr")
-                target_para.insert(0, ppr)
-            rpr = ppr.find(f"{{{W_NS}}}rPr")
-            if rpr is None:
-                rpr = etree.SubElement(ppr, f"{{{W_NS}}}rPr")
-            ins = etree.SubElement(rpr, f"{{{W_NS}}}ins")
-            ins.set(f"{{{W_NS}}}id", str(change_id))
-            ins.set(f"{{{W_NS}}}author", author)
-            ins.set(f"{{{W_NS}}}date", ts)
-            change_id += 1
-
-        elif mod_type == "delete":
-            # Insert a deleted paragraph before the target
-            del_para = etree.Element(f"{{{W_NS}}}p")
-            ppr = etree.SubElement(del_para, f"{{{W_NS}}}pPr")
-            rpr = etree.SubElement(ppr, f"{{{W_NS}}}rPr")
-            del_mark = etree.SubElement(rpr, f"{{{W_NS}}}del")
-            del_mark.set(f"{{{W_NS}}}id", str(change_id))
-            del_mark.set(f"{{{W_NS}}}author", author)
-            del_mark.set(f"{{{W_NS}}}date", ts)
-            change_id += 1
-
-            # Add the deleted text as a del run
-            del_wrapper = etree.SubElement(del_para, f"{{{W_NS}}}del")
-            del_wrapper.set(f"{{{W_NS}}}id", str(change_id))
-            del_wrapper.set(f"{{{W_NS}}}author", author)
-            del_wrapper.set(f"{{{W_NS}}}date", ts)
-            change_id += 1
-
-            run = etree.SubElement(del_wrapper, f"{{{W_NS}}}r")
-            del_text = etree.SubElement(run, f"{{{W_NS}}}delText")
-            del_text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-            del_text.text = text
-
-            # Insert before target paragraph
-            parent = target_para.getparent()
-            if parent is not None:
-                idx = list(parent).index(target_para)
-                parent.insert(idx, del_para)
+            stats["updated"] += max(i2 - i1, j2 - j1)
 
     # Write modified XML back to the docx
     modified_xml = etree.tostring(doc_root, xml_declaration=True, encoding="UTF-8")
 
-    # Update the zip file
     with zipfile.ZipFile(output_path, "r") as zf_in:
-        file_list = zf_in.namelist()
         file_contents = {}
-        for name in file_list:
+        for name in zf_in.namelist():
             if name == "word/document.xml":
                 file_contents[name] = modified_xml
             else:
@@ -349,7 +411,9 @@ def compare_with_xml(
             zf_out.writestr(name, content)
 
     return True, (
-        f"XML-based comparison complete. "
-        f"Note: This is paragraph-level granularity only. "
-        f"For word-level tracked changes, install pywin32 and use Word COM."
+        f"XML-based comparison complete: "
+        f"{stats['added']} added, {stats['deleted']} deleted, "
+        f"{stats['updated']} updated paragraph(s). "
+        f"Note: Paragraph-level granularity only. "
+        f"For word-level tracked changes, use Word COM."
     )
