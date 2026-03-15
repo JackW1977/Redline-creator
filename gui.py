@@ -177,7 +177,8 @@ class RevisionCompareApp:
         self.output_var = tk.StringVar()
         self.author_var = tk.StringVar(value=DEFAULT_AUTHOR)
         self.force_xml_var = tk.BooleanVar(value=False)
-        self.carry_comments_var = tk.BooleanVar(value=True)
+        # Comment source: "none", "early", "latest", "both"
+        self.comment_source_var = tk.StringVar(value="early")
         self.verbose_var = tk.BooleanVar(value=True)
         self.running = False
         self._output_was_auto = False  # tracks if output path was auto-generated
@@ -359,17 +360,52 @@ class RevisionCompareApp:
         opt_row2 = ttk.Frame(opt_card, style="Card.TFrame")
         opt_row2.pack(fill="x", pady=(6, 0))
 
-        carry_cb = ttk.Checkbutton(opt_row2, text="Carry over comments from Early Revision",
-                         variable=self.carry_comments_var,
-                         style="App.TCheckbutton")
-        carry_cb.pack(side="left")
-        ToolTip(carry_cb,
-                "When checked, review comments from the Early Revision\n"
-                "are extracted, mapped to the best matching location in\n"
-                "the Latest Revision, and inserted into the output.\n\n"
-                "When unchecked, only tracked changes (redlines) are\n"
-                "generated \u2014 faster, no comments in the output.\n\n"
+        comment_lbl = ttk.Label(opt_row2, text="Carry over comments:",
+                                style="Card.TLabel")
+        comment_lbl.pack(side="left")
+        ToolTip(comment_lbl,
+                "Choose which source file(s) to pull review comments from.\n"
+                "Comments are extracted, mapped to the best matching\n"
+                "location in the output, and inserted as native Word comments.")
+
+        radio_none = ttk.Radiobutton(opt_row2, text="None",
+                        variable=self.comment_source_var, value="none",
+                        style="App.TCheckbutton")
+        radio_none.pack(side="left", padx=(10, 0))
+        ToolTip(radio_none,
+                "No comment carry-over. The output will contain\n"
+                "only tracked changes (redlines). Fastest option.")
+
+        radio_early = ttk.Radiobutton(opt_row2, text="Early Rev",
+                        variable=self.comment_source_var, value="early",
+                        style="App.TCheckbutton")
+        radio_early.pack(side="left", padx=(10, 0))
+        ToolTip(radio_early,
+                "Carry over comments from the Early Revision only.\n"
+                "Comments are mapped to matching locations in the\n"
+                "Latest Revision and inserted into the output.\n\n"
                 "Pre-condition: Early Revision must contain comments.")
+
+        radio_latest = ttk.Radiobutton(opt_row2, text="Latest Rev",
+                        variable=self.comment_source_var, value="latest",
+                        style="App.TCheckbutton")
+        radio_latest.pack(side="left", padx=(10, 0))
+        ToolTip(radio_latest,
+                "Carry over comments from the Latest Revision only.\n"
+                "Comments are kept at their existing locations in the\n"
+                "output (since the output is based on the Latest Rev).\n\n"
+                "Pre-condition: Latest Revision must contain comments.")
+
+        radio_both = ttk.Radiobutton(opt_row2, text="Both (merged)",
+                        variable=self.comment_source_var, value="both",
+                        style="App.TCheckbutton")
+        radio_both.pack(side="left", padx=(10, 0))
+        ToolTip(radio_both,
+                "Merge comments from BOTH the Early and Latest Revisions.\n"
+                "Comments from the Early Rev are mapped to new locations;\n"
+                "comments from the Latest Rev are kept in place.\n"
+                "Duplicates (same author + text) are automatically removed.\n\n"
+                "Pre-condition: At least one file must contain comments.")
 
         # ── Action row ───────────────────────────────────────────────────
         action_frame = ttk.Frame(outer, style="App.TFrame")
@@ -555,17 +591,24 @@ class RevisionCompareApp:
         warn("Recommendation: Leave unchecked if you have Word installed. "
              "Only check this if Word is unavailable or COM is causing errors.")
 
-        h3("Carry Over Comments from Early Revision")
-        p("When checked (the default), comments from the Early Revision are "
-          "extracted, mapped to the closest matching location in the Latest "
-          "Revision, and inserted into the output document. This includes "
-          "multi-strategy mapping, deduplication, and an Unmapped Comments "
-          "appendix for any comments that couldn't be placed.")
-        p("When unchecked, the comment pipeline (Steps 1, 3, and 4) is skipped "
-          "entirely. The output will contain only tracked changes (redlines) "
-          "with no review comments. This is faster and useful when you only "
-          "need a redline comparison without comment carry-over.")
-        dim("Default: Checked (comments are carried over)")
+        h3("Carry Over Comments")
+        p("Controls which source file(s) to pull review comments from. "
+          "Four options are available:")
+        bullet("None \u2014 No comment carry-over. The output contains only "
+               "tracked changes (redlines). Fastest option.")
+        bullet("Early Rev (default) \u2014 Comments from the Early Revision are "
+               "extracted, mapped to the closest matching location in the "
+               "Latest Revision, and inserted into the output. Includes "
+               "multi-strategy mapping, deduplication, and an Unmapped "
+               "Comments appendix for any that couldn't be placed.")
+        bullet("Latest Rev \u2014 Comments from the Latest Revision are carried "
+               "into the output at their existing locations. Since the output "
+               "is based on the Latest Rev, these map directly.")
+        bullet("Both (merged) \u2014 Comments from both files are merged into "
+               "the output. Early Rev comments are mapped to new locations; "
+               "Latest Rev comments are kept in place. Duplicates (same "
+               "author + text) are automatically removed.")
+        dim("Default: Early Rev")
 
         h3("Verbose Logging")
         p("When checked, the log panel shows debug-level detail: every "
@@ -645,7 +688,10 @@ class RevisionCompareApp:
         p("Additional flags:")
         mono("  --author \"Jane Doe\"    Author name for tracked changes\n"
              "  --force-xml            Use pure-XML comparison (no Word COM)\n"
-             "  --skip-comments        Redlines only, no comment carry-over\n"
+             "  --comments none        No comment carry-over\n"
+             "  --comments early       Comments from Early Rev (default)\n"
+             "  --comments latest      Comments from Latest Rev\n"
+             "  --comments both        Merge comments from both files\n"
              "  --verbose              Enable debug-level logging\n"
              "  --log comparison.log   Write log to a file\n"
              "  --report report.json   Write a JSON pipeline report")
@@ -910,7 +956,7 @@ class RevisionCompareApp:
                 output_path=self.output_var.get().strip(),
                 author=self.author_var.get().strip() or DEFAULT_AUTHOR,
                 force_xml=self.force_xml_var.get(),
-                skip_comments=not self.carry_comments_var.get(),
+                comment_source=self.comment_source_var.get(),
                 verbose=self.verbose_var.get(),
             )
             self.root.after(0, self._on_complete, results)

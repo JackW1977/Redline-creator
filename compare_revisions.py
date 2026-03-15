@@ -3,7 +3,7 @@
 Compares two Word document revisions and produces a new document that:
 1. Looks like the Latest Rev (formatting, layout, structure preserved)
 2. Contains tracked changes showing differences from Early Rev
-3. Optionally carries forward all review comments from Early Rev
+3. Optionally carries forward review comments from Early Rev, Latest Rev, or both
 
 Usage:
     python compare_revisions.py early_rev.docx latest_rev.docx output.docx [options]
@@ -12,7 +12,8 @@ Example:
     python compare_revisions.py draft_v1.docx draft_v2.docx comparison_output.docx
     python compare_revisions.py draft_v1.docx draft_v2.docx output.docx --force-xml
     python compare_revisions.py draft_v1.docx draft_v2.docx output.docx --author "John Doe"
-    python compare_revisions.py draft_v1.docx draft_v2.docx output.docx --skip-comments
+    python compare_revisions.py draft_v1.docx draft_v2.docx output.docx --comments both
+    python compare_revisions.py draft_v1.docx draft_v2.docx output.docx --comments none
 """
 
 from __future__ import annotations
@@ -51,6 +52,7 @@ def run_comparison(
     output_path: str | Path,
     author: str = DEFAULT_AUTHOR,
     force_xml: bool = False,
+    comment_source: str = "early",
     skip_comments: bool = False,
     log_file: str | None = None,
     verbose: bool = False,
@@ -63,13 +65,23 @@ def run_comparison(
         output_path: Path for the output document.
         author: Author name for tracked changes.
         force_xml: Force pure-XML comparison (skip COM).
-        skip_comments: Skip comment extraction, mapping, and insertion.
+        comment_source: Which files to pull comments from:
+            "none" - no comments, "early" - Early Rev only,
+            "latest" - Latest Rev only, "both" - merge from both.
+        skip_comments: Legacy flag; if True, overrides comment_source to "none".
         log_file: Optional path for detailed log output.
         verbose: Enable debug logging.
 
     Returns:
         Dict with pipeline results and statistics.
     """
+    # Legacy compatibility: skip_comments overrides comment_source
+    if skip_comments:
+        comment_source = "none"
+    comment_source = comment_source.lower()
+    if comment_source not in ("none", "early", "latest", "both"):
+        comment_source = "early"
+
     setup_logging(log_file, verbose)
     start_time = time.time()
 
@@ -83,8 +95,11 @@ def run_comparison(
         "output": str(output_path),
         "success": False,
         "steps": {},
+        "comment_source": comment_source,
         "comments": {
             "total_extracted": 0,
+            "early_extracted": 0,
+            "latest_extracted": 0,
             "mapped_exact": 0,
             "mapped_fuzzy": 0,
             "mapped_paragraph": 0,
@@ -99,8 +114,9 @@ def run_comparison(
     logger.info("=" * 60)
     logger.info("MS Word Redline Creator")
     logger.info("=" * 60)
-    if skip_comments:
-        logger.info("  Comment carry-over: DISABLED")
+    _source_labels = {"none": "DISABLED", "early": "Early Rev",
+                      "latest": "Latest Rev", "both": "Both (merged)"}
+    logger.info(f"  Comment carry-over: {_source_labels.get(comment_source, comment_source)}")
 
     if not early_rev_path.exists():
         results["errors"].append(f"Early revision not found: {early_rev_path}")
@@ -122,41 +138,61 @@ def run_comparison(
         logger.error(results["errors"][-1])
         return results
 
-    # ── Step 1: Extract comments from Early Rev ──────────────────────────
-    if skip_comments:
+    # ── Step 1: Extract comments from source file(s) ───────────────────
+    early_comments: list[ExtractedComment] = []
+    latest_comments: list[ExtractedComment] = []
+    comments: list[ExtractedComment] = []
+
+    if comment_source == "none":
         logger.info("")
         logger.info("Step 1: SKIPPED (comment carry-over disabled).")
-        comments = []
     else:
         logger.info("")
-        logger.info("Step 1: Extracting comments from Early Rev...")
         step_start = time.time()
 
-        try:
-            comments = extract_comments(early_rev_path)
-            results["comments"]["total_extracted"] = len(comments)
-            results["steps"]["extract_comments"] = {
-                "success": True,
-                "count": len(comments),
-                "duration": time.time() - step_start,
-            }
-            logger.info(f"  Found {len(comments)} comment(s) in Early Rev.")
-            for c in comments:
-                logger.debug(
-                    f"  Comment {c.comment_id} by {c.author}: "
-                    f"'{c.text[:60]}...' anchored to '{c.anchor_text[:40]}...'"
-                )
-        except Exception as e:
-            msg = f"Failed to extract comments: {e}"
-            results["errors"].append(msg)
-            logger.error(f"  {msg}")
-            # Continue - comparison can still work without comments
-            comments = []
-            results["steps"]["extract_comments"] = {
-                "success": False,
-                "error": msg,
-                "duration": time.time() - step_start,
-            }
+        # Extract from Early Rev if needed
+        if comment_source in ("early", "both"):
+            logger.info("Step 1: Extracting comments from Early Rev...")
+            try:
+                early_comments = extract_comments(early_rev_path)
+                results["comments"]["early_extracted"] = len(early_comments)
+                logger.info(f"  Found {len(early_comments)} comment(s) in Early Rev.")
+                for c in early_comments:
+                    logger.debug(
+                        f"  Comment {c.comment_id} by {c.author}: "
+                        f"'{c.text[:60]}...' anchored to '{c.anchor_text[:40]}...'"
+                    )
+            except Exception as e:
+                msg = f"Failed to extract comments from Early Rev: {e}"
+                results["warnings"].append(msg)
+                logger.warning(f"  {msg}")
+
+        # Extract from Latest Rev if needed
+        if comment_source in ("latest", "both"):
+            logger.info("Step 1: Extracting comments from Latest Rev...")
+            try:
+                latest_comments = extract_comments(latest_rev_path)
+                results["comments"]["latest_extracted"] = len(latest_comments)
+                logger.info(f"  Found {len(latest_comments)} comment(s) in Latest Rev.")
+                for c in latest_comments:
+                    logger.debug(
+                        f"  Comment {c.comment_id} by {c.author}: "
+                        f"'{c.text[:60]}...' anchored to '{c.anchor_text[:40]}...'"
+                    )
+            except Exception as e:
+                msg = f"Failed to extract comments from Latest Rev: {e}"
+                results["warnings"].append(msg)
+                logger.warning(f"  {msg}")
+
+        comments = early_comments + latest_comments
+        results["comments"]["total_extracted"] = len(comments)
+        results["steps"]["extract_comments"] = {
+            "success": True,
+            "count": len(comments),
+            "early_count": len(early_comments),
+            "latest_count": len(latest_comments),
+            "duration": time.time() - step_start,
+        }
 
     # ── Step 2: Generate tracked changes via document comparison ─────────
     logger.info("")
@@ -203,16 +239,30 @@ def run_comparison(
         logger.warning(f"  Style transplant warning (non-fatal): {e}")
 
     # ── Step 3: Map comments to Latest Rev locations ─────────────────────
+    mapping_results: list[MappingResult] = []
     if comments:
         logger.info("")
         logger.info("Step 3: Mapping comments to Latest Rev locations...")
         step_start = time.time()
 
         try:
-            early_paras = extract_from_docx(early_rev_path)
             latest_paras = extract_from_docx(latest_rev_path)
 
-            mapping_results = map_comments(comments, early_paras, latest_paras)
+            # Map Early Rev comments (text may have moved between revisions)
+            if early_comments:
+                early_paras = extract_from_docx(early_rev_path)
+                early_mapping = map_comments(early_comments, early_paras, latest_paras)
+                mapping_results.extend(early_mapping)
+                logger.info(f"  Mapped {len(early_mapping)} Early Rev comment(s).")
+
+            # Map Latest Rev comments (already at correct locations — use direct mapping)
+            if latest_comments:
+                # Latest Rev comments are at their original locations, which match
+                # the output structure. Map them using latest_paras as both source
+                # and target for exact matching.
+                latest_mapping = map_comments(latest_comments, latest_paras, latest_paras)
+                mapping_results.extend(latest_mapping)
+                logger.info(f"  Mapped {len(latest_mapping)} Latest Rev comment(s).")
 
             # Tally mapping strategies
             for r in mapping_results:
@@ -234,7 +284,7 @@ def run_comparison(
 
             mapped_count = len(mapping_results) - results["comments"]["unmapped"]
             logger.info(
-                f"  Mapped {mapped_count}/{len(comments)} comments: "
+                f"  Total: {mapped_count}/{len(comments)} comments mapped: "
                 f"{results['comments']['mapped_exact']} exact, "
                 f"{results['comments']['mapped_fuzzy']} fuzzy, "
                 f"{results['comments']['mapped_paragraph']} paragraph, "
@@ -253,7 +303,6 @@ def run_comparison(
                 "duration": time.time() - step_start,
             }
     else:
-        mapping_results = []
         logger.info("")
         logger.info("Step 3: No comments to map (skipping).")
 
@@ -315,8 +364,12 @@ def run_comparison(
     logger.info(f"  Output: {output_path}")
     logger.info(f"  Duration: {elapsed:.1f}s")
     if comments:
+        src_detail = ""
+        if results["comments"]["early_extracted"] and results["comments"]["latest_extracted"]:
+            src_detail = (f" ({results['comments']['early_extracted']} early + "
+                          f"{results['comments']['latest_extracted']} latest)")
         logger.info(
-            f"  Comments: {results['comments']['total_extracted']} extracted, "
+            f"  Comments: {results['comments']['total_extracted']} extracted{src_detail}, "
             f"{results['comments']['total_extracted'] - results['comments']['unmapped']} mapped, "
             f"{results['comments']['unmapped']} unmapped"
         )
@@ -351,9 +404,15 @@ Examples:
         help="Force pure-XML comparison (skip Word COM automation)",
     )
     parser.add_argument(
+        "--comments",
+        choices=["none", "early", "latest", "both"],
+        default="early",
+        help="Which file(s) to carry comments from: none, early (default), latest, both",
+    )
+    parser.add_argument(
         "--skip-comments",
         action="store_true",
-        help="Skip comment extraction, mapping, and insertion (redlines only)",
+        help="Legacy flag; equivalent to --comments none",
     )
     parser.add_argument(
         "--log",
@@ -373,13 +432,14 @@ Examples:
 
     args = parser.parse_args()
 
+    comment_source = "none" if args.skip_comments else args.comments
     results = run_comparison(
         early_rev_path=args.early_rev,
         latest_rev_path=args.latest_rev,
         output_path=args.output,
         author=args.author,
         force_xml=args.force_xml,
-        skip_comments=args.skip_comments,
+        comment_source=comment_source,
         log_file=args.log,
         verbose=args.verbose,
     )
