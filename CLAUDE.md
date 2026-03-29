@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Project Location
+
+Windows path: `C:\Users\wyzis\ClaudeProjects\docx-revision-compare`
+
 ## Project Overview
 
 MS Word Redline Creator — a Windows application that compares two `.docx` files and produces a new document with tracked changes (redlines). Optionally carries forward review comments from source documents.
